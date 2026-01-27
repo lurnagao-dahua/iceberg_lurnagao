@@ -1,0 +1,2281 @@
+commit 376fb11cffd21aa21e3c9062b6bdc0bd9069e5b6
+Author: 鏌虫潹 <liu_yang42@dahuatech.com>
+Date:   Tue Jan 6 16:36:14 2026 +0800
+
+    Iceberg鍚戦噺鍖栬鍙栨敮鎸乸age绾у埆杩囨护
+
+diff --git a/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/VectorizedArrowReader.java b/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/VectorizedArrowReader.java
+index 2cc7cde4..2045dc4e 100644
+--- a/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/VectorizedArrowReader.java
++++ b/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/VectorizedArrowReader.java
+@@ -18,6 +18,8 @@
+  */
+ package org.apache.iceberg.arrow.vectorized;
+ 
++import java.util.Iterator;
++import java.util.List;
+ import java.util.Map;
+ import java.util.Optional;
+ import org.apache.arrow.memory.ArrowBuf;
+@@ -43,10 +45,12 @@ import org.apache.arrow.vector.types.pojo.FieldType;
+ import org.apache.iceberg.MetadataColumns;
+ import org.apache.iceberg.arrow.ArrowAllocation;
+ import org.apache.iceberg.arrow.ArrowSchemaUtil;
++import org.apache.iceberg.arrow.vectorized.parquet.ParquetReadState;
+ import org.apache.iceberg.arrow.vectorized.parquet.VectorizedColumnIterator;
+ import org.apache.iceberg.parquet.ParquetUtil;
+ import org.apache.iceberg.parquet.VectorizedReader;
+ import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
++import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+ import org.apache.iceberg.types.Types;
+ import org.apache.parquet.column.ColumnDescriptor;
+ import org.apache.parquet.column.Dictionary;
+@@ -83,6 +87,7 @@ public class VectorizedArrowReader implements VectorizedReader<VectorHolder> {
+   // data
+   // present in the vector may not necessarily be dictionary encoded.
+   private Dictionary dictionary;
++  private ParquetReadState readState;
+ 
+   public VectorizedArrowReader(
+       ColumnDescriptor desc,
+@@ -371,12 +376,16 @@ public class VectorizedArrowReader implements VectorizedReader<VectorHolder> {
+   }
+ 
+   @Override
+-  public void setRowGroupInfo(PageReadStore source, Map<ColumnPath, ColumnChunkMetaData> metadata) {
++  public void setRowGroupInfo(
++      PageReadStore source,
++      Map<ColumnPath, ColumnChunkMetaData> metadata) {
++    readState = new ParquetReadState(source.getRowIndexes().orElse(null));
+     ColumnChunkMetaData chunkMetaData = metadata.get(ColumnPath.get(columnDescriptor.getPath()));
+     this.dictionary =
+         vectorizedColumnIterator.setRowGroupInfo(
+             source.getPageReader(columnDescriptor),
+-            !ParquetUtil.hasNonDictionaryPages(chunkMetaData));
++            !ParquetUtil.hasNonDictionaryPages(chunkMetaData),
++            readState);
+   }
+ 
+   @Override
+@@ -649,6 +658,9 @@ public class VectorizedArrowReader implements VectorizedReader<VectorHolder> {
+     private long rowStart;
+     private int batchSize;
+     private NullabilityHolder nulls;
++    private ParquetReadState readState;
++    private long readOrder;
++    private long curRowPosRowGroup;
+ 
+     PositionVectorReader(boolean setArrowValidityVector) {
+       super(MetadataColumns.ROW_POSITION);
+@@ -667,7 +679,12 @@ public class VectorizedArrowReader implements VectorizedReader<VectorHolder> {
+ 
+       ArrowBuf dataBuffer = vec.getDataBuffer();
+       for (int i = 0; i < numValsToRead; i += 1) {
+-        dataBuffer.setLong((long) i * Long.BYTES, rowStart + i);
++        if (readState.getReadOrderToRowGroupPosMap().containsKey(readOrder)) {
++          curRowPosRowGroup = readState.getReadOrderToRowGroupPosMap().get(readOrder);
++        }
++        dataBuffer.setLong((long) i * Long.BYTES, rowStart + curRowPosRowGroup);
++        readOrder++;
++        curRowPosRowGroup++;
+       }
+ 
+       if (setArrowValidityVector) {
+@@ -677,7 +694,6 @@ public class VectorizedArrowReader implements VectorizedReader<VectorHolder> {
+         }
+       }
+ 
+-      rowStart += numValsToRead;
+       vec.setValueCount(numValsToRead);
+ 
+       return new VectorHolder.PositionVectorHolder(vec, MetadataColumns.ROW_POSITION, nulls);
+@@ -700,6 +716,9 @@ public class VectorizedArrowReader implements VectorizedReader<VectorHolder> {
+                   () ->
+                       new IllegalArgumentException(
+                           "PageReadStore does not contain row index offset"));
++      readState = new ParquetReadState(source.getRowIndexes().orElse(null));
++      readOrder = 0;
++      curRowPosRowGroup = 0;
+     }
+ 
+     @Override
+diff --git a/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/BaseVectorizedParquetValuesReader.java b/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/BaseVectorizedParquetValuesReader.java
+index b0a75cce..02ecd220 100644
+--- a/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/BaseVectorizedParquetValuesReader.java
++++ b/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/BaseVectorizedParquetValuesReader.java
+@@ -217,7 +217,7 @@ public class BaseVectorizedParquetValuesReader extends ValuesReader {
+ 
+   @Override
+   public void skip() {
+-    throw new UnsupportedOperationException();
++    this.readInteger();
+   }
+ 
+   @Override
+@@ -240,4 +240,24 @@ public class BaseVectorizedParquetValuesReader extends ValuesReader {
+     }
+     throw new RuntimeException("Unrecognized mode: " + mode);
+   }
++
++  /** Skip `n` values from the current reader. */
++  public void skipValues(int total) {
++    int left = total;
++    while (left > 0) {
++      if (this.currentCount == 0) {
++        this.readNextGroup();
++      }
++      int num = Math.min(left, this.currentCount);
++      switch (mode) {
++        case RLE:
++          break;
++        case PACKED:
++          packedValuesBufferIdx += num;
++          break;
++      }
++      currentCount -= num;
++      left -= num;
++    }
++  }
+ }
+diff --git a/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/ParquetReadState.java b/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/ParquetReadState.java
+new file mode 100644
+index 00000000..2d9054fe
+--- /dev/null
++++ b/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/ParquetReadState.java
+@@ -0,0 +1,209 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.iceberg.arrow.vectorized.parquet;
++
++import java.util.ArrayList;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Map;
++import java.util.PrimitiveIterator;
++
++import org.apache.iceberg.relocated.com.google.common.collect.Lists;
++import org.apache.iceberg.relocated.com.google.common.collect.Maps;
++
++public class ParquetReadState {
++  /** A special row range used when there is no row indexes (hence all rows must be included) */
++  private static final RowRange MAX_ROW_RANGE = new RowRange(Long.MIN_VALUE, Long.MAX_VALUE);
++
++  /**
++   * A special row range used when the row indexes are present AND all the row ranges have been
++   * processed. This serves as a sentinel at the end indicating that all rows come after the last
++   * row range should be skipped.
++   */
++  private static final RowRange END_ROW_RANGE = new RowRange(Long.MAX_VALUE, Long.MIN_VALUE);
++
++  /**
++   * The current index over all rows within the column chunk. This is used to check if the current
++   * row should be skipped by comparing against the row ranges.
++   */
++  private long currentRowIndex;
++
++  /** The offset in the current batch to put the next value in value vector */
++  private int valueOffset;
++
++  /** The remaining number of values to read in the current page */
++  private int valuesToReadInPage;
++
++  /** Iterator over all row ranges, only not-null if column index is present */
++  private final Iterator<RowRange> rowRanges;
++
++  /** The current row range */
++  private RowRange currentRange;
++
++  /** The remaining number of rows to read in the current batch */
++  private int rowsToReadInBatch;
++
++  /** The actual number of rows read in this batch on the current page, including skipped rows */
++  private int rowsWithSkipsInThisBatch;
++
++  /** 
++   * Mapping from read order to actual position in row group.
++   * rowIndexes: [0, 1, 2, 4, 5, 7, 8, 9] -> rowRanges: [0-2], [4-5], [7-9]
++   * readOrderToRowGroupPosMap: [0 -> 0, 3 -> 4, 5 -> 7]
++   */
++  private final Map<Long, Long> readOrderToRowGroupPosMap = Maps.newHashMap();
++
++  public ParquetReadState(PrimitiveIterator.OfLong rowIndexes) {
++    this.rowRanges = constructRanges(rowIndexes);
++    nextRange();
++  }
++
++  /** Advance to the next range. */
++  void nextRange() {
++    if (rowRanges == null) {
++      currentRange = MAX_ROW_RANGE;
++    } else if (!rowRanges.hasNext()) {
++      currentRange = END_ROW_RANGE;
++    } else {
++      currentRange = rowRanges.next();
++    }
++  }
++
++  public long currentRangeStart() {
++    return currentRange.getStart();
++  }
++
++  public long currentRangeEnd() {
++    return currentRange.getEnd();
++  }
++
++  /** Must be called at the beginning of reading a new page. */
++  void resetForNewPage(int totalValuesInPage, long pageFirstRowIndex) {
++    this.valuesToReadInPage = totalValuesInPage;
++    this.currentRowIndex = pageFirstRowIndex;
++  }
++
++  /** Must be called at the beginning of reading a new batch. */
++  void resetForNewBatch(int batchSize) {
++    this.valueOffset = 0;
++    this.rowsToReadInBatch = batchSize;
++  }
++
++  /**
++   * Construct a list of row ranges from the given `rowIndexes`. For example, suppose the
++   * `rowIndexes` are `[0, 1, 2, 4, 5, 7, 8, 9]`, it will be converted into 3 row ranges:
++   * `[0-2], [4-5], [7-9]`.
++   */
++  private Iterator<RowRange> constructRanges(PrimitiveIterator.OfLong rowIndexes) {
++    if (rowIndexes == null) {
++      return null;
++    }
++
++    List<RowRange> rowRanges = Lists.newArrayList();
++    long currentStart = Long.MIN_VALUE;
++    long previous = Long.MIN_VALUE;
++    long readOrder = 0;
++
++    while (rowIndexes.hasNext()) {
++      long idx = rowIndexes.nextLong();
++      if (currentStart == Long.MIN_VALUE) {
++        currentStart = idx;
++      } else if (previous + 1 != idx) {
++        RowRange range = new RowRange(currentStart, previous);
++        readOrderToRowGroupPosMap.put(readOrder, currentStart);
++        readOrder += previous - currentStart + 1;
++        rowRanges.add(range);
++        currentStart = idx;
++      }
++      previous = idx;
++    }
++
++    if (previous != Long.MIN_VALUE) {
++      rowRanges.add(new RowRange(currentStart, previous));
++      readOrderToRowGroupPosMap.put(readOrder, currentStart);
++    }
++
++    return rowRanges.iterator();
++  }
++
++  int getValuesToReadInPage() {
++    return valuesToReadInPage;
++  }
++
++  void setValuesToReadInPage(int valuesToReadInPage) {
++    this.valuesToReadInPage = valuesToReadInPage;
++  }
++
++  long getCurrentRowIndex() {
++    return currentRowIndex;
++  }
++
++  void setCurrentRowIndex(long currentRowIndex) {
++    this.currentRowIndex = currentRowIndex;
++  }
++
++  int getRowsToReadInBatch() {
++    return rowsToReadInBatch;
++  }
++
++  public void setRowsToReadInBatch(int rowsToReadInBatch) {
++    this.rowsToReadInBatch = rowsToReadInBatch;
++  }
++
++  public int getRowsWithSkipsInThisBatch() {
++    return rowsWithSkipsInThisBatch;
++  }
++
++  public void setRowsWithSkipsInThisBatch(int rowsWithSkipsInThisBatch) {
++    this.rowsWithSkipsInThisBatch = rowsWithSkipsInThisBatch;
++  }
++
++  public int getValueOffset() {
++    return valueOffset;
++  }
++
++  public void setValueOffset(int valueOffset) {
++    this.valueOffset = valueOffset;
++  }
++
++  public Map<Long, Long> getReadOrderToRowGroupPosMap() {
++    return readOrderToRowGroupPosMap;
++  }
++
++  /**
++   * Helper struct to represent a range of row indexes `[start, end]`.
++   */
++  private static class RowRange {
++    private final long start;
++    private final long end;
++
++    RowRange(long start, long end) {
++      this.start = start;
++      this.end = end;
++    }
++
++    public long getStart() {
++      return start;
++    }
++    
++    public long getEnd() {
++      return end;
++    }
++  }
++}
+diff --git a/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/VectorizedColumnIterator.java b/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/VectorizedColumnIterator.java
+index 8e52fd1a..6dc728ec 100644
+--- a/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/VectorizedColumnIterator.java
++++ b/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/VectorizedColumnIterator.java
+@@ -18,14 +18,17 @@
+  */
+ package org.apache.iceberg.arrow.vectorized.parquet;
+ 
++import java.util.Iterator;
+ import org.apache.arrow.vector.FieldVector;
+ import org.apache.arrow.vector.IntVector;
+ import org.apache.iceberg.arrow.vectorized.NullabilityHolder;
+ import org.apache.iceberg.parquet.BaseColumnIterator;
+ import org.apache.iceberg.parquet.BasePageIterator;
++import org.apache.iceberg.parquet.ParquetUtil;
+ import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+ import org.apache.parquet.column.ColumnDescriptor;
+ import org.apache.parquet.column.Dictionary;
++import org.apache.parquet.column.page.DataPage;
+ import org.apache.parquet.column.page.PageReader;
+ 
+ /**
+@@ -36,6 +39,7 @@ public class VectorizedColumnIterator extends BaseColumnIterator {
+ 
+   private final VectorizedPageIterator vectorizedPageIterator;
+   private int batchSize;
++  private ParquetReadState readState;
+ 
+   public VectorizedColumnIterator(
+       ColumnDescriptor desc, String writerVersion, boolean setArrowValidityVector) {
+@@ -51,10 +55,12 @@ public class VectorizedColumnIterator extends BaseColumnIterator {
+     this.batchSize = batchSize;
+   }
+ 
+-  public Dictionary setRowGroupInfo(PageReader store, boolean allPagesDictEncoded) {
++  public Dictionary setRowGroupInfo(
++      PageReader store, boolean allPagesDictEncoded, ParquetReadState readState) {
+     // setPageSource can result in a data page read. If that happens, we need
+     // to know in advance whether all the pages in the row group are dictionary encoded or not
+     this.vectorizedPageIterator.setAllPagesDictEncoded(allPagesDictEncoded);
++    this.readState = readState;
+     super.setPageSource(store);
+     return dictionary;
+   }
+@@ -64,167 +70,154 @@ public class VectorizedColumnIterator extends BaseColumnIterator {
+     return vectorizedPageIterator;
+   }
+ 
++  @Override
++  protected void advance() {
++    if (readState.getValuesToReadInPage() == 0) {
++      BasePageIterator pageIterator = pageIterator();
++      while (!pageIterator.hasNext()) {
++        DataPage page = pageSource.readPage();
++        if (page != null) {
++          pageIterator.setPage(page);
++          readState.resetForNewPage(page.getValueCount(), page.getFirstRowIndex().orElse(0L));
++          this.advanceNextPageCount += pageIterator.currentPageCount();
++        } else {
++          return;
++        }
++      }
++    }
++  }
++
+   public boolean producesDictionaryEncodedVector() {
+     return vectorizedPageIterator.producesDictionaryEncodedVector();
+   }
+ 
+   public abstract class BatchReader {
+     public void nextBatch(FieldVector fieldVector, int typeWidth, NullabilityHolder holder) {
+-      int rowsReadSoFar = 0;
+-      while (rowsReadSoFar < batchSize && hasNext()) {
++      readState.resetForNewBatch(batchSize);
++      while (readState.getRowsToReadInBatch() > 0 && hasNext()) {
+         advance();
+-        int rowsInThisBatch =
+-            nextBatchOf(fieldVector, batchSize - rowsReadSoFar, rowsReadSoFar, typeWidth, holder);
+-        rowsReadSoFar += rowsInThisBatch;
+-        triplesRead += rowsInThisBatch;
+-        fieldVector.setValueCount(rowsReadSoFar);
++        readState.setRowsWithSkipsInThisBatch(0);
++        nextBatchOf(fieldVector, typeWidth, holder, readState);
++        triplesRead += readState.getRowsWithSkipsInThisBatch();
++        fieldVector.setValueCount(batchSize - readState.getRowsToReadInBatch());
+       }
+     }
+ 
+-    protected abstract int nextBatchOf(
+-        FieldVector vector,
+-        int expectedBatchSize,
+-        int numValsInVector,
+-        int typeWidth,
+-        NullabilityHolder holder);
++    protected abstract void nextBatchOf(
++        FieldVector vector, int typeWidth, NullabilityHolder holder, ParquetReadState state);
+   }
+ 
+   public class IntegerBatchReader extends BatchReader {
+     @Override
+-    protected int nextBatchOf(
++    protected void nextBatchOf(
+         final FieldVector vector,
+-        final int expectedBatchSize,
+-        final int numValsInVector,
+         final int typeWidth,
+-        NullabilityHolder holder) {
+-      return vectorizedPageIterator
+-          .intPageReader()
+-          .nextBatch(vector, expectedBatchSize, numValsInVector, typeWidth, holder);
++        NullabilityHolder holder,
++        ParquetReadState state) {
++      vectorizedPageIterator.intPageReader().nextBatch(vector, typeWidth, holder, state);
+     }
+   }
+ 
+   public class DictionaryBatchReader extends BatchReader {
+     @Override
+-    protected int nextBatchOf(
++    protected void nextBatchOf(
+         final FieldVector vector,
+-        final int expectedBatchSize,
+-        final int numValsInVector,
+         final int typeWidth,
+-        NullabilityHolder holder) {
+-      return vectorizedPageIterator.nextBatchDictionaryIds(
+-          (IntVector) vector, expectedBatchSize, numValsInVector, holder);
++        NullabilityHolder holder,
++        ParquetReadState state) {
++      vectorizedPageIterator.nextBatchDictionaryIds((IntVector) vector, holder, state);
+     }
+   }
+ 
+   public class LongBatchReader extends BatchReader {
+     @Override
+-    protected int nextBatchOf(
++    protected void nextBatchOf(
+         final FieldVector vector,
+-        final int expectedBatchSize,
+-        final int numValsInVector,
+         final int typeWidth,
+-        NullabilityHolder holder) {
+-      return vectorizedPageIterator
+-          .longPageReader()
+-          .nextBatch(vector, expectedBatchSize, numValsInVector, typeWidth, holder);
++        NullabilityHolder holder,
++        ParquetReadState state) {
++      vectorizedPageIterator.longPageReader().nextBatch(vector, typeWidth, holder, state);
+     }
+   }
+ 
+   public class TimestampMillisBatchReader extends BatchReader {
+     @Override
+-    protected int nextBatchOf(
++    protected void nextBatchOf(
+         final FieldVector vector,
+-        final int expectedBatchSize,
+-        final int numValsInVector,
+         final int typeWidth,
+-        NullabilityHolder holder) {
+-      return vectorizedPageIterator
++        NullabilityHolder holder,
++        ParquetReadState state) {
++      vectorizedPageIterator
+           .timestampMillisPageReader()
+-          .nextBatch(vector, expectedBatchSize, numValsInVector, typeWidth, holder);
++          .nextBatch(vector, typeWidth, holder, state);
+     }
+   }
+ 
+   public class TimestampInt96BatchReader extends BatchReader {
+     @Override
+-    protected int nextBatchOf(
++    protected void nextBatchOf(
+         final FieldVector vector,
+-        final int expectedBatchSize,
+-        final int numValsInVector,
+         final int typeWidth,
+-        NullabilityHolder holder) {
+-      return vectorizedPageIterator
+-          .timestampInt96PageReader()
+-          .nextBatch(vector, expectedBatchSize, numValsInVector, typeWidth, holder);
++        NullabilityHolder holder,
++        ParquetReadState state) {
++      vectorizedPageIterator.timestampInt96PageReader().nextBatch(vector, typeWidth, holder, state);
+     }
+   }
+ 
+   public class FloatBatchReader extends BatchReader {
+     @Override
+-    protected int nextBatchOf(
++    protected void nextBatchOf(
+         final FieldVector vector,
+-        final int expectedBatchSize,
+-        final int numValsInVector,
+         final int typeWidth,
+-        NullabilityHolder holder) {
+-      return vectorizedPageIterator
+-          .floatPageReader()
+-          .nextBatch(vector, expectedBatchSize, numValsInVector, typeWidth, holder);
++        NullabilityHolder holder,
++        ParquetReadState state) {
++      vectorizedPageIterator.floatPageReader().nextBatch(vector, typeWidth, holder, state);
+     }
+   }
+ 
+   public class DoubleBatchReader extends BatchReader {
+     @Override
+-    protected int nextBatchOf(
++    protected void nextBatchOf(
+         final FieldVector vector,
+-        final int expectedBatchSize,
+-        final int numValsInVector,
+         final int typeWidth,
+-        NullabilityHolder holder) {
+-      return vectorizedPageIterator
+-          .doublePageReader()
+-          .nextBatch(vector, expectedBatchSize, numValsInVector, typeWidth, holder);
++        NullabilityHolder holder,
++        ParquetReadState state) {
++      vectorizedPageIterator.doublePageReader().nextBatch(vector, typeWidth, holder, state);
+     }
+   }
+ 
+   public class FixedSizeBinaryBatchReader extends BatchReader {
+     @Override
+-    protected int nextBatchOf(
++    protected void nextBatchOf(
+         final FieldVector vector,
+-        final int expectedBatchSize,
+-        final int numValsInVector,
+         final int typeWidth,
+-        NullabilityHolder holder) {
+-      return vectorizedPageIterator
++        NullabilityHolder holder,
++        ParquetReadState state) {
++      vectorizedPageIterator
+           .fixedSizeBinaryPageReader()
+-          .nextBatch(vector, expectedBatchSize, numValsInVector, typeWidth, holder);
++          .nextBatch(vector, typeWidth, holder, state);
+     }
+   }
+ 
+   public class VarWidthTypeBatchReader extends BatchReader {
+     @Override
+-    protected int nextBatchOf(
++    protected void nextBatchOf(
+         final FieldVector vector,
+-        final int expectedBatchSize,
+-        final int numValsInVector,
+         final int typeWidth,
+-        NullabilityHolder holder) {
+-      return vectorizedPageIterator
+-          .varWidthTypePageReader()
+-          .nextBatch(vector, expectedBatchSize, numValsInVector, typeWidth, holder);
++        NullabilityHolder holder,
++        ParquetReadState state) {
++      vectorizedPageIterator.varWidthTypePageReader().nextBatch(vector, typeWidth, holder, state);
+     }
+   }
+ 
+   public class BooleanBatchReader extends BatchReader {
+     @Override
+-    protected int nextBatchOf(
++    protected void nextBatchOf(
+         final FieldVector vector,
+-        final int expectedBatchSize,
+-        final int numValsInVector,
+         final int typeWidth,
+-        NullabilityHolder holder) {
+-      return vectorizedPageIterator
+-          .booleanPageReader()
+-          .nextBatch(vector, expectedBatchSize, numValsInVector, typeWidth, holder);
++        NullabilityHolder holder,
++        ParquetReadState state) {
++      vectorizedPageIterator.booleanPageReader().nextBatch(vector, typeWidth, holder, state);
+     }
+   }
+ 
+diff --git a/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/VectorizedDeltaEncodedValuesReader.java b/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/VectorizedDeltaEncodedValuesReader.java
+index 115518e1..baa87798 100644
+--- a/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/VectorizedDeltaEncodedValuesReader.java
++++ b/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/VectorizedDeltaEncodedValuesReader.java
+@@ -132,11 +132,21 @@ public class VectorizedDeltaEncodedValuesReader extends ValuesReader
+     readValues(total, vec, rowId, INT_SIZE, (f, i, v) -> f.getDataBuffer().setInt(i, (int) v));
+   }
+ 
++  @Override
++  public void skipIntegers(int total) {
++    readValues(total, null, -1, INT_SIZE, (f, i, v) -> {});
++  }
++
+   @Override
+   public void readLongs(int total, FieldVector vec, int rowId) {
+     readValues(total, vec, rowId, LONG_SIZE, (f, i, v) -> f.getDataBuffer().setLong(i, v));
+   }
+ 
++  @Override
++  public void skipLongs(int total) {
++    readValues(total, null, -1, LONG_SIZE, (f, i, v) -> {});
++  }
++
+   /** DELTA_BINARY_PACKED only supports INT32 and INT64 */
+   @Override
+   public void readFloats(int total, FieldVector vec, int rowId) {
+diff --git a/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/VectorizedPageIterator.java b/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/VectorizedPageIterator.java
+index be1a3324..18e67371 100644
+--- a/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/VectorizedPageIterator.java
++++ b/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/VectorizedPageIterator.java
+@@ -155,81 +155,49 @@ public class VectorizedPageIterator extends BasePageIterator {
+    * Method for reading a batch of dictionary ids from the dictionary encoded data pages. Like
+    * definition levels, dictionary ids in Parquet are RLE/bin-packed encoded as well.
+    */
+-  public int nextBatchDictionaryIds(
+-      final IntVector vector,
+-      final int expectedBatchSize,
+-      final int numValsInVector,
+-      NullabilityHolder holder) {
+-    final int actualBatchSize = getActualBatchSize(expectedBatchSize);
+-    if (actualBatchSize <= 0) {
+-      return 0;
+-    }
++  public void nextBatchDictionaryIds(
++      final IntVector vector, NullabilityHolder holder, ParquetReadState readState) {
+     vectorizedDefinitionLevelReader
+         .dictionaryIdReader()
+-        .nextDictEncodedBatch(
+-            vector,
+-            numValsInVector,
+-            -1,
+-            actualBatchSize,
+-            holder,
+-            dictionaryEncodedValuesReader,
+-            null);
+-    triplesRead += actualBatchSize;
+-    this.hasNext = triplesRead < triplesCount;
+-    return actualBatchSize;
++        .nextDictEncodedBatch(vector, -1, holder, dictionaryEncodedValuesReader, null, readState);
++    this.hasNext = readState.getValuesToReadInPage() > 0;
+   }
+ 
+   abstract class BasePageReader {
+-    public int nextBatch(
+-        FieldVector vector,
+-        int expectedBatchSize,
+-        int numValsInVector,
+-        int typeWidth,
+-        NullabilityHolder holder) {
+-      final int actualBatchSize = getActualBatchSize(expectedBatchSize);
+-      if (actualBatchSize <= 0) {
+-        return 0;
+-      }
++    public void nextBatch(
++        FieldVector vector, int typeWidth, NullabilityHolder holder, ParquetReadState readState) {
+       if (dictionaryDecodeMode == DictionaryDecodeMode.EAGER) {
+-        nextDictEncodedVal(vector, actualBatchSize, numValsInVector, typeWidth, holder);
++        nextDictEncodedVal(vector, typeWidth, holder, readState);
+       } else {
+-        nextVal(vector, actualBatchSize, numValsInVector, typeWidth, holder);
++        nextVal(vector, typeWidth, holder, readState);
+       }
+-      triplesRead += actualBatchSize;
+-      hasNext = triplesRead < triplesCount;
+-      return actualBatchSize;
++      hasNext = readState.getValuesToReadInPage() > 0;
+     }
+ 
+     protected abstract void nextVal(
+-        FieldVector vector, int batchSize, int numVals, int typeWidth, NullabilityHolder holder);
++        FieldVector vector, int typeWidth, NullabilityHolder holder, ParquetReadState readState);
+ 
+     protected abstract void nextDictEncodedVal(
+-        FieldVector vector, int batchSize, int numVals, int typeWidth, NullabilityHolder holder);
++        FieldVector vector, int typeWidth, NullabilityHolder holder, ParquetReadState readState);
+   }
+ 
+   /** Method for reading a batch of values of INT32 data type */
+   class IntPageReader extends BasePageReader {
+     @Override
+     protected void nextVal(
+-        FieldVector vector, int batchSize, int numVals, int typeWidth, NullabilityHolder holder) {
++        FieldVector vector, int typeWidth, NullabilityHolder holder, ParquetReadState readState) {
+       vectorizedDefinitionLevelReader
+           .integerReader()
+-          .nextBatch(vector, numVals, typeWidth, batchSize, holder, valuesReader);
++          .nextBatch(vector, typeWidth, holder, valuesReader, readState);
+     }
+ 
+     @Override
+     protected void nextDictEncodedVal(
+-        FieldVector vector, int batchSize, int numVals, int typeWidth, NullabilityHolder holder) {
++        FieldVector vector, int typeWidth, NullabilityHolder holder, ParquetReadState readState) {
+       vectorizedDefinitionLevelReader
+           .integerReader()
+           .nextDictEncodedBatch(
+-              vector,
+-              numVals,
+-              typeWidth,
+-              batchSize,
+-              holder,
+-              dictionaryEncodedValuesReader,
+-              dictionary);
++              vector, typeWidth, holder, dictionaryEncodedValuesReader, dictionary, readState);
+     }
+   }
+ 
+@@ -238,25 +206,19 @@ public class VectorizedPageIterator extends BasePageIterator {
+ 
+     @Override
+     protected void nextVal(
+-        FieldVector vector, int batchSize, int numVals, int typeWidth, NullabilityHolder holder) {
++        FieldVector vector, int typeWidth, NullabilityHolder holder, ParquetReadState readState) {
+       vectorizedDefinitionLevelReader
+           .longReader()
+-          .nextBatch(vector, numVals, typeWidth, batchSize, holder, valuesReader);
++          .nextBatch(vector, typeWidth, holder, valuesReader, readState);
+     }
+ 
+     @Override
+     protected void nextDictEncodedVal(
+-        FieldVector vector, int batchSize, int numVals, int typeWidth, NullabilityHolder holder) {
++        FieldVector vector, int typeWidth, NullabilityHolder holder, ParquetReadState readState) {
+       vectorizedDefinitionLevelReader
+           .longReader()
+           .nextDictEncodedBatch(
+-              vector,
+-              numVals,
+-              typeWidth,
+-              batchSize,
+-              holder,
+-              dictionaryEncodedValuesReader,
+-              dictionary);
++              vector, typeWidth, holder, dictionaryEncodedValuesReader, dictionary, readState);
+     }
+   }
+ 
+@@ -269,25 +231,19 @@ public class VectorizedPageIterator extends BasePageIterator {
+ 
+     @Override
+     protected void nextVal(
+-        FieldVector vector, int batchSize, int numVals, int typeWidth, NullabilityHolder holder) {
++        FieldVector vector, int typeWidth, NullabilityHolder holder, ParquetReadState readState) {
+       vectorizedDefinitionLevelReader
+           .timestampMillisReader()
+-          .nextBatch(vector, numVals, typeWidth, batchSize, holder, valuesReader);
++          .nextBatch(vector, typeWidth, holder, valuesReader, readState);
+     }
+ 
+     @Override
+     protected void nextDictEncodedVal(
+-        FieldVector vector, int batchSize, int numVals, int typeWidth, NullabilityHolder holder) {
++        FieldVector vector, int typeWidth, NullabilityHolder holder, ParquetReadState readState) {
+       vectorizedDefinitionLevelReader
+           .timestampMillisReader()
+           .nextDictEncodedBatch(
+-              vector,
+-              numVals,
+-              typeWidth,
+-              batchSize,
+-              holder,
+-              dictionaryEncodedValuesReader,
+-              dictionary);
++              vector, typeWidth, holder, dictionaryEncodedValuesReader, dictionary, readState);
+     }
+   }
+ 
+@@ -295,25 +251,19 @@ public class VectorizedPageIterator extends BasePageIterator {
+   class TimestampInt96PageReader extends BasePageReader {
+     @Override
+     protected void nextVal(
+-        FieldVector vector, int batchSize, int numVals, int typeWidth, NullabilityHolder holder) {
++        FieldVector vector, int typeWidth, NullabilityHolder holder, ParquetReadState readState) {
+       vectorizedDefinitionLevelReader
+           .timestampInt96Reader()
+-          .nextBatch(vector, numVals, typeWidth, batchSize, holder, valuesReader);
++          .nextBatch(vector, typeWidth, holder, valuesReader, readState);
+     }
+ 
+     @Override
+     protected void nextDictEncodedVal(
+-        FieldVector vector, int batchSize, int numVals, int typeWidth, NullabilityHolder holder) {
++        FieldVector vector, int typeWidth, NullabilityHolder holder, ParquetReadState readState) {
+       vectorizedDefinitionLevelReader
+           .timestampInt96Reader()
+           .nextDictEncodedBatch(
+-              vector,
+-              numVals,
+-              typeWidth,
+-              batchSize,
+-              holder,
+-              dictionaryEncodedValuesReader,
+-              dictionary);
++              vector, typeWidth, holder, dictionaryEncodedValuesReader, dictionary, readState);
+     }
+   }
+ 
+@@ -322,25 +272,19 @@ public class VectorizedPageIterator extends BasePageIterator {
+ 
+     @Override
+     protected void nextVal(
+-        FieldVector vector, int batchSize, int numVals, int typeWidth, NullabilityHolder holder) {
++        FieldVector vector, int typeWidth, NullabilityHolder holder, ParquetReadState readState) {
+       vectorizedDefinitionLevelReader
+           .floatReader()
+-          .nextBatch(vector, numVals, typeWidth, batchSize, holder, valuesReader);
++          .nextBatch(vector, typeWidth, holder, valuesReader, readState);
+     }
+ 
+     @Override
+     protected void nextDictEncodedVal(
+-        FieldVector vector, int batchSize, int numVals, int typeWidth, NullabilityHolder holder) {
++        FieldVector vector, int typeWidth, NullabilityHolder holder, ParquetReadState readState) {
+       vectorizedDefinitionLevelReader
+           .floatReader()
+           .nextDictEncodedBatch(
+-              vector,
+-              numVals,
+-              typeWidth,
+-              batchSize,
+-              holder,
+-              dictionaryEncodedValuesReader,
+-              dictionary);
++              vector, typeWidth, holder, dictionaryEncodedValuesReader, dictionary, readState);
+     }
+   }
+ 
+@@ -349,54 +293,38 @@ public class VectorizedPageIterator extends BasePageIterator {
+ 
+     @Override
+     protected void nextVal(
+-        FieldVector vector, int batchSize, int numVals, int typeWidth, NullabilityHolder holder) {
++        FieldVector vector, int typeWidth, NullabilityHolder holder, ParquetReadState readState) {
+       vectorizedDefinitionLevelReader
+           .doubleReader()
+-          .nextBatch(vector, numVals, typeWidth, batchSize, holder, valuesReader);
++          .nextBatch(vector, typeWidth, holder, valuesReader, readState);
+     }
+ 
+     @Override
+     protected void nextDictEncodedVal(
+-        FieldVector vector, int batchSize, int numVals, int typeWidth, NullabilityHolder holder) {
++        FieldVector vector, int typeWidth, NullabilityHolder holder, ParquetReadState readState) {
+       vectorizedDefinitionLevelReader
+           .doubleReader()
+           .nextDictEncodedBatch(
+-              vector,
+-              numVals,
+-              typeWidth,
+-              batchSize,
+-              holder,
+-              dictionaryEncodedValuesReader,
+-              dictionary);
++              vector, typeWidth, holder, dictionaryEncodedValuesReader, dictionary, readState);
+     }
+   }
+ 
+-  private int getActualBatchSize(int expectedBatchSize) {
+-    return Math.min(expectedBatchSize, triplesCount - triplesRead);
+-  }
+-
+   class FixedSizeBinaryPageReader extends BasePageReader {
+     @Override
+     protected void nextVal(
+-        FieldVector vector, int batchSize, int numVals, int typeWidth, NullabilityHolder holder) {
++        FieldVector vector, int typeWidth, NullabilityHolder holder, ParquetReadState readState) {
+       vectorizedDefinitionLevelReader
+           .fixedSizeBinaryReader()
+-          .nextBatch(vector, numVals, typeWidth, batchSize, holder, valuesReader);
++          .nextBatch(vector, typeWidth, holder, valuesReader, readState);
+     }
+ 
+     @Override
+     protected void nextDictEncodedVal(
+-        FieldVector vector, int batchSize, int numVals, int typeWidth, NullabilityHolder holder) {
++        FieldVector vector, int typeWidth, NullabilityHolder holder, ParquetReadState readState) {
+       vectorizedDefinitionLevelReader
+           .fixedSizeBinaryReader()
+           .nextDictEncodedBatch(
+-              vector,
+-              numVals,
+-              typeWidth,
+-              batchSize,
+-              holder,
+-              dictionaryEncodedValuesReader,
+-              dictionary);
++              vector, typeWidth, holder, dictionaryEncodedValuesReader, dictionary, readState);
+     }
+   }
+ 
+@@ -404,25 +332,19 @@ public class VectorizedPageIterator extends BasePageIterator {
+   class VarWidthTypePageReader extends BasePageReader {
+     @Override
+     protected void nextVal(
+-        FieldVector vector, int batchSize, int numVals, int typeWidth, NullabilityHolder holder) {
++        FieldVector vector, int typeWidth, NullabilityHolder holder, ParquetReadState readState) {
+       vectorizedDefinitionLevelReader
+           .varWidthReader()
+-          .nextBatch(vector, numVals, typeWidth, batchSize, holder, valuesReader);
++          .nextBatch(vector, typeWidth, holder, valuesReader, readState);
+     }
+ 
+     @Override
+     protected void nextDictEncodedVal(
+-        FieldVector vector, int batchSize, int numVals, int typeWidth, NullabilityHolder holder) {
++        FieldVector vector, int typeWidth, NullabilityHolder holder, ParquetReadState readState) {
+       vectorizedDefinitionLevelReader
+           .varWidthReader()
+           .nextDictEncodedBatch(
+-              vector,
+-              numVals,
+-              typeWidth,
+-              batchSize,
+-              holder,
+-              dictionaryEncodedValuesReader,
+-              dictionary);
++              vector, typeWidth, holder, dictionaryEncodedValuesReader, dictionary, readState);
+     }
+   }
+ 
+@@ -430,15 +352,15 @@ public class VectorizedPageIterator extends BasePageIterator {
+   class BooleanPageReader extends BasePageReader {
+     @Override
+     protected void nextVal(
+-        FieldVector vector, int batchSize, int numVals, int typeWidth, NullabilityHolder holder) {
++        FieldVector vector, int typeWidth, NullabilityHolder holder, ParquetReadState readState) {
+       vectorizedDefinitionLevelReader
+           .booleanReader()
+-          .nextBatch(vector, numVals, typeWidth, batchSize, holder, valuesReader);
++          .nextBatch(vector, typeWidth, holder, valuesReader, readState);
+     }
+ 
+     @Override
+     protected void nextDictEncodedVal(
+-        FieldVector vector, int batchSize, int numVals, int typeWidth, NullabilityHolder holder) {
++        FieldVector vector, int typeWidth, NullabilityHolder holder, ParquetReadState readState) {
+       throw new UnsupportedOperationException();
+     }
+   }
+diff --git a/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/VectorizedParquetDefinitionLevelReader.java b/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/VectorizedParquetDefinitionLevelReader.java
+index 1ca3bfe8..c75d85ea 100644
+--- a/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/VectorizedParquetDefinitionLevelReader.java
++++ b/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/VectorizedParquetDefinitionLevelReader.java
+@@ -30,6 +30,7 @@ import org.apache.arrow.vector.IntVector;
+ import org.apache.iceberg.arrow.vectorized.NullabilityHolder;
+ import org.apache.iceberg.parquet.ParquetUtil;
+ import org.apache.parquet.column.Dictionary;
++import org.apache.parquet.column.values.ValuesReader;
+ 
+ public final class VectorizedParquetDefinitionLevelReader
+     extends BaseVectorizedParquetValuesReader {
+@@ -49,46 +50,82 @@ public final class VectorizedParquetDefinitionLevelReader
+     void apply(Mode mode, int idx, int numValues, byte[] byteArray, ArrowBuf validityBuffer);
+   }
+ 
++  @FunctionalInterface
++  interface SkipValuesFunction {
++    void apply(Mode mode, int total);
++  }
++
+   abstract class CommonReader {
+     private void nextBatch(
+         final FieldVector vector,
+-        final int startOffset,
+         final int typeWidth,
+-        final int numValsToRead,
+-        ReaderFunction consumer) {
+-      int idx = startOffset;
+-      int left = numValsToRead;
+-      while (left > 0) {
++        ReaderFunction consumer,
++        SkipValuesFunction skipValuesFunction,
++        ParquetReadState state) {
++      int leftInBatch = state.getRowsToReadInBatch();
++      int leftInPage = state.getValuesToReadInPage();
++      long rowId = state.getCurrentRowIndex();
++      int rowsWithSkipsInThisBatch = 0;
++      while (leftInBatch > 0 && leftInPage > 0) {
+         if (currentCount == 0) {
+           readNextGroup();
+         }
+-        int numValues = Math.min(left, currentCount);
++        int numValues = Math.min(leftInBatch, Math.min(leftInPage, currentCount));
++        long rangeStart = state.currentRangeStart();
++        long rangeEnd = state.currentRangeEnd();
+ 
+         byte[] byteArray = null;
+         if (typeWidth > -1) {
+           byteArray = new byte[typeWidth];
+         }
+         ArrowBuf validityBuffer = vector.getValidityBuffer();
+-
+-        consumer.apply(mode, idx, numValues, byteArray, validityBuffer);
+-        idx += numValues;
+-        left -= numValues;
+-        currentCount -= numValues;
++        // If [rowId, rowId + numValues) is wholly before or after the current row range,
++        // we skip to the start of the current row range or advance the current row range
++        if (rowId + numValues < rangeStart) {
++          skipValuesFunction.apply(mode, numValues);
++          rowId += numValues;
++          leftInPage -= numValues;
++          rowsWithSkipsInThisBatch += numValues;
++        } else if (rowId > rangeEnd) {
++          state.nextRange();
++        } else {
++          // The range [rowId, rowId + numValues) overlaps with the current row range in state
++          long start = Math.max(rangeStart, rowId);
++          long end = Math.min(rangeEnd, rowId + numValues - 1);
++          // Skip the part [rowId, start)
++          int toSkip = (int) (start - rowId);
++          if (toSkip > 0) {
++            skipValuesFunction.apply(mode, toSkip);
++            rowId += toSkip;
++            leftInPage -= toSkip;
++            rowsWithSkipsInThisBatch += toSkip;
++          }
++          // Read the part [start, end]
++          numValues = (int) (end - start + 1);
++          consumer.apply(mode, state.getValueOffset(), numValues, byteArray, validityBuffer);
++          state.setValueOffset(state.getValueOffset() + numValues);
++          leftInBatch -= numValues;
++          leftInPage -= numValues;
++          rowId += numValues;
++          currentCount -= numValues;
++          state.setRowsToReadInBatch(state.getRowsToReadInBatch() - numValues);
++          rowsWithSkipsInThisBatch += numValues;
++        }
+       }
++      state.setValuesToReadInPage(leftInPage);
++      state.setCurrentRowIndex(rowId);
++      state.setRowsWithSkipsInThisBatch(rowsWithSkipsInThisBatch);
+     }
+ 
+     public void nextBatch(
+         final FieldVector vector,
+-        final int startOffset,
+         final int typeWidth,
+-        final int numValsToRead,
+         NullabilityHolder nullabilityHolder,
+-        VectorizedValuesReader valuesReader) {
++        VectorizedValuesReader valuesReader,
++        ParquetReadState readState) {
+       nextBatch(
+           vector,
+-          startOffset,
+           typeWidth,
+-          numValsToRead,
+           (mode, idx, numValues, byteArray, validityBuffer) -> {
+             switch (mode) {
+               case RLE:
+@@ -99,22 +136,21 @@ public final class VectorizedParquetDefinitionLevelReader
+                 nextPackedBatch(
+                     vector, typeWidth, nullabilityHolder, valuesReader, idx, numValues, byteArray);
+             }
+-          });
++          },
++          (mode, n) -> skipValues(mode, (ValuesReader) valuesReader, n, typeWidth),
++          readState);
+     }
+ 
+     public void nextDictEncodedBatch(
+         final FieldVector vector,
+-        final int startOffset,
+         final int typeWidth,
+-        final int numValsToRead,
+         NullabilityHolder nullabilityHolder,
+         VectorizedDictionaryEncodedParquetValuesReader valuesReader,
+-        Dictionary dict) {
++        Dictionary dict,
++        ParquetReadState readState) {
+       nextBatch(
+           vector,
+-          startOffset,
+           typeWidth,
+-          numValsToRead,
+           (mode, idx, numValues, byteArray, validityBuffer) -> {
+             switch (mode) {
+               case RLE:
+@@ -139,7 +175,9 @@ public final class VectorizedParquetDefinitionLevelReader
+                     numValues,
+                     validityBuffer);
+             }
+-          });
++          },
++          (mode, n) -> skipValues(mode, valuesReader, n, typeWidth),
++          readState);
+     }
+ 
+     protected abstract void nextRleBatch(
+@@ -169,7 +207,8 @@ public final class VectorizedParquetDefinitionLevelReader
+         int idx,
+         int numValues,
+         ArrowBuf validityBuffer) {
+-      if (currentValue == maxDefLevel) {
++      if (currentValue
++          == maxDefLevel) {
+         nextDictEncodedVal(
+             vector, idx, valuesReader, dict, mode, numValues, nullabilityHolder, typeWidth);
+       } else {
+@@ -211,6 +250,51 @@ public final class VectorizedParquetDefinitionLevelReader
+         int numValues,
+         NullabilityHolder holder,
+         int typeWidth);
++
++    /**
++     * Skip the next `n` values (either null or non-null) from this definition level reader and
++     * `valueReader`.
++     */
++    public void skipValues(Mode mode, ValuesReader valuesReader, int total, int typeWidth) {
++      int left = total;
++      while (left > 0) {
++        if (currentCount == 0) {
++          readNextGroup();
++        }
++        int num = Math.min(left, currentCount);
++        switch (mode) {
++          case RLE:
++            // we only need to skip non-null values from `valuesReader` since nulls are represented
++            // via definition levels which are skipped here via decrementing `currentCount`.
++            if (currentValue == maxDefLevel) {
++              if (valuesReader instanceof VectorizedValuesReader) {
++                skipValues((VectorizedValuesReader) valuesReader, num, typeWidth);
++              } else if (valuesReader instanceof VectorizedDictionaryEncodedParquetValuesReader) {
++                ((VectorizedDictionaryEncodedParquetValuesReader) valuesReader).skipValues(num);
++              }
++            }
++            break;
++          case PACKED:
++            int totalSkipNum = 0;
++            for (int i = 0; i < num; ++i) {
++              // same as above, only skip non-null values from `valuesReader`
++              if (packedValuesBuffer[packedValuesBufferIdx++] == maxDefLevel) {
++                ++totalSkipNum;
++              }
++            }
++            if (valuesReader instanceof VectorizedValuesReader) {
++              skipValues((VectorizedValuesReader) valuesReader, totalSkipNum, typeWidth);
++            } else if (valuesReader instanceof VectorizedDictionaryEncodedParquetValuesReader) {
++              ((VectorizedDictionaryEncodedParquetValuesReader) valuesReader).skipValues(num);
++            }
++            break;
++        }
++        currentCount -= num;
++        left -= num;
++      }
++    }
++
++    public abstract void skipValues(VectorizedValuesReader valuesReader, int total, int typeWidth);
+   }
+ 
+   abstract class NumericBaseReader extends CommonReader {
+@@ -308,6 +392,11 @@ public final class VectorizedParquetDefinitionLevelReader
+         FieldVector vector, int rowId, VectorizedValuesReader valuesReader, int total) {
+       valuesReader.readLongs(total, vector, rowId);
+     }
++
++    @Override
++    public void skipValues(VectorizedValuesReader valuesReader, int total, int typeWidth) {
++      valuesReader.skipLongs(total);
++    }
+   }
+ 
+   class DoubleReader extends NumericBaseReader {
+@@ -341,6 +430,11 @@ public final class VectorizedParquetDefinitionLevelReader
+         FieldVector vector, int rowId, VectorizedValuesReader valuesReader, int total) {
+       valuesReader.readDoubles(total, vector, rowId);
+     }
++
++    @Override
++    public void skipValues(VectorizedValuesReader valuesReader, int total, int typeWidth) {
++      valuesReader.skipDoubles(total);
++    }
+   }
+ 
+   class FloatReader extends NumericBaseReader {
+@@ -374,6 +468,11 @@ public final class VectorizedParquetDefinitionLevelReader
+         FieldVector vector, int rowId, VectorizedValuesReader valuesReader, int total) {
+       valuesReader.readFloats(total, vector, rowId);
+     }
++
++    @Override
++    public void skipValues(VectorizedValuesReader valuesReader, int total, int typeWidth) {
++      valuesReader.skipFloats(total);
++    }
+   }
+ 
+   class IntegerReader extends NumericBaseReader {
+@@ -409,6 +508,11 @@ public final class VectorizedParquetDefinitionLevelReader
+         FieldVector vector, int rowId, VectorizedValuesReader valuesReader, int total) {
+       valuesReader.readIntegers(total, vector, rowId);
+     }
++
++    @Override
++    public void skipValues(VectorizedValuesReader valuesReader, int total, int typeWidth) {
++      valuesReader.skipIntegers(total);
++    }
+   }
+ 
+   abstract class BaseReader extends CommonReader {
+@@ -481,6 +585,11 @@ public final class VectorizedParquetDefinitionLevelReader
+       vector.getDataBuffer().setLong((long) idx * typeWidth, valuesReader.readLong() * 1000);
+     }
+ 
++    @Override
++    public void skipValues(VectorizedValuesReader valuesReader, int total, int typeWidth) {
++      valuesReader.skipLongs(total);
++    }
++
+     @Override
+     protected void nextDictEncodedVal(
+         FieldVector vector,
+@@ -517,6 +626,11 @@ public final class VectorizedParquetDefinitionLevelReader
+       vector.getDataBuffer().setLong((long) idx * typeWidth, timestampInt96);
+     }
+ 
++    @Override
++    public void skipValues(VectorizedValuesReader valuesReader, int total, int typeWidth) {
++      valuesReader.skipFixedSizeBinary(total, 12);
++    }
++
+     @Override
+     protected void nextDictEncodedVal(
+         FieldVector vector,
+@@ -560,6 +674,11 @@ public final class VectorizedParquetDefinitionLevelReader
+       ((FixedSizeBinaryVector) vector).set(idx, byteArray);
+     }
+ 
++    @Override
++    public void skipValues(VectorizedValuesReader valuesReader, int total, int typeWidth) {
++      valuesReader.skipFixedSizeBinary(total, typeWidth);
++    }
++
+     @Override
+     protected void nextDictEncodedVal(
+         FieldVector vector,
+@@ -607,6 +726,11 @@ public final class VectorizedParquetDefinitionLevelReader
+       }
+     }
+ 
++    @Override
++    public void skipValues(VectorizedValuesReader valuesReader, int total, int typeWidth) {
++      valuesReader.skipBinary(total);
++    }
++
+     @Override
+     protected void nextDictEncodedVal(
+         FieldVector vector,
+@@ -639,6 +763,11 @@ public final class VectorizedParquetDefinitionLevelReader
+       ((BitVector) vector).setSafe(idx, valuesReader.readBoolean() ? 1 : 0);
+     }
+ 
++    @Override
++    public void skipValues(VectorizedValuesReader valuesReader, int total, int typeWidth) {
++      valuesReader.skipBooleans(total);
++    }
++
+     @Override
+     protected void nextDictEncodedVal(
+         FieldVector vector,
+@@ -665,6 +794,11 @@ public final class VectorizedParquetDefinitionLevelReader
+       throw new UnsupportedOperationException();
+     }
+ 
++    @Override
++    public void skipValues(VectorizedValuesReader valuesReader, int total, int typeWidth) {
++      throw new UnsupportedOperationException();
++    }
++
+     @Override
+     protected void nextDictEncodedVal(
+         FieldVector vector,
+diff --git a/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/VectorizedPlainValuesReader.java b/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/VectorizedPlainValuesReader.java
+index 764b2fc3..840f1793 100644
+--- a/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/VectorizedPlainValuesReader.java
++++ b/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/VectorizedPlainValuesReader.java
+@@ -18,6 +18,7 @@
+  */
+ package org.apache.iceberg.arrow.vectorized.parquet;
+ 
++import java.io.IOException;
+ import java.nio.ByteBuffer;
+ import org.apache.arrow.vector.FieldVector;
+ import org.apache.iceberg.parquet.ValuesAsBytesReader;
+@@ -50,6 +51,27 @@ class VectorizedPlainValuesReader extends ValuesAsBytesReader implements Vectori
+     }
+   }
+ 
++  @Override
++  public void skipBinary(int total) {
++    try {
++      for (int i = 0; i < total; i++) {
++        int len = readInteger();
++        getValuesInputStream().skipFully(len);
++      }
++    } catch (IOException e) {
++      throw new RuntimeException("Failed to skip " + total + " bytes", e);
++    }
++  }
++
++  @Override
++  public void skipFixedSizeBinary(int total, int len) {
++    try {
++      getValuesInputStream().skipFully(total * (long) len);
++    } catch (IOException e) {
++      throw new RuntimeException("Failed to skip " + total + " bytes", e);
++    }
++  }
++
+   private void readValues(int total, FieldVector vec, int rowId, int typeWidth) {
+     ByteBuffer buffer = getBuffer(total * typeWidth);
+     vec.getDataBuffer().setBytes((long) rowId * typeWidth, buffer);
+@@ -60,18 +82,61 @@ class VectorizedPlainValuesReader extends ValuesAsBytesReader implements Vectori
+     readValues(total, vec, rowId, INT_SIZE);
+   }
+ 
++  @Override
++  public void skipIntegers(int total) {
++    try {
++      getValuesInputStream().skipFully((long) total * INT_SIZE);
++    } catch (IOException e) {
++      throw new RuntimeException(e);
++    }
++  }
++
+   @Override
+   public void readLongs(int total, FieldVector vec, int rowId) {
+     readValues(total, vec, rowId, LONG_SIZE);
+   }
+ 
++  @Override
++  public void skipLongs(int total) {
++    try {
++      getValuesInputStream().skipFully((long) total * LONG_SIZE);
++    } catch (IOException e) {
++      throw new RuntimeException("Failed to skip " + total + " bytes", e);
++    }
++  }
++
+   @Override
+   public void readFloats(int total, FieldVector vec, int rowId) {
+     readValues(total, vec, rowId, FLOAT_SIZE);
+   }
+ 
++  @Override
++  public void skipFloats(int total) {
++    try {
++      getValuesInputStream().skipFully((long) total * FLOAT_SIZE);
++    } catch (IOException e) {
++      throw new RuntimeException("Failed to skip " + total + " bytes", e);
++    }
++  }
++
+   @Override
+   public void readDoubles(int total, FieldVector vec, int rowId) {
+     readValues(total, vec, rowId, DOUBLE_SIZE);
+   }
++
++  @Override
++  public void skipDoubles(int total) {
++    try {
++      getValuesInputStream().skipFully((long) total * DOUBLE_SIZE);
++    } catch (IOException e) {
++      throw new RuntimeException("Failed to skip " + total + " bytes", e);
++    }
++  }
++
++  @Override
++  public void skipBooleans(int total) {
++    for (int i = 0; i < total; i++) {
++      readBooleanAsInt();
++    }
++  }
+ }
+diff --git a/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/VectorizedValuesReader.java b/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/VectorizedValuesReader.java
+index 7c23149b..b853d7cb 100644
+--- a/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/VectorizedValuesReader.java
++++ b/src/arrow/src/main/java/org/apache/iceberg/arrow/vectorized/parquet/VectorizedValuesReader.java
+@@ -76,6 +76,41 @@ interface VectorizedValuesReader {
+   /** Read `total` doubles into `vec` starting at `vec[rowId]` */
+   void readDoubles(int total, FieldVector vec, int rowId);
+ 
++  /*
++   * Skips `total` values
++   */
++  default void skipBooleans(int total) {
++    throw new UnsupportedOperationException();
++  }
++
++  default void skipIntegers(int total) {
++    throw new UnsupportedOperationException();
++  }
++
++  default void skipLongs(int total) {
++    throw new UnsupportedOperationException();
++  }
++
++  default void skipFloats(int total) {
++    throw new UnsupportedOperationException();
++  }
++
++  default void skipDoubles(int total) {
++    throw new UnsupportedOperationException();
++  }
++
++  default void skipBinary(int total) {
++    throw new UnsupportedOperationException();
++  }
++
++  default void skipFixedSizeBinary(int total, int len) {
++    throw new UnsupportedOperationException();
++  }
++
++  default void skipBytes(int total) {
++    throw new UnsupportedOperationException();
++  }
++
+   /**
+    * Initialize the reader from a page. See {@link ValuesReader#initFromPage(int,
+    * ByteBufferInputStream)}.
+diff --git a/src/parquet/src/main/java/org/apache/iceberg/parquet/Parquet.java b/src/parquet/src/main/java/org/apache/iceberg/parquet/Parquet.java
+index 2b2e460e..f1526ac9 100644
+--- a/src/parquet/src/main/java/org/apache/iceberg/parquet/Parquet.java
++++ b/src/parquet/src/main/java/org/apache/iceberg/parquet/Parquet.java
+@@ -1430,7 +1430,6 @@ public class Parquet {
+         }
+ 
+         optionsBuilder.withUseHadoopVectoredIo(true);
+-        ParquetReadOptions options = optionsBuilder.build();
+ 
+         NameMapping mapping;
+         if (nameMapping != null) {
+@@ -1442,10 +1441,17 @@ public class Parquet {
+         }
+ 
+         if (batchedReaderFunc != null) {
++          if (filter != null) {
++            MessageType type = getSchemaFromFile(fileDecryptionProperties);
++            Schema fileSchema = ParquetSchemaUtil.convert(type);
++            optionsBuilder.useRecordFilter();
++            optionsBuilder.withRecordFilter(
++                ParquetFilters.convert(fileSchema, filter, caseSensitive));
++          }
+           return new VectorizedParquetReader<>(
+               file,
+               schema,
+-              options,
++              optionsBuilder.build(),
+               batchedReaderFunc,
+               mapping,
+               filter,
+@@ -1461,7 +1467,7 @@ public class Parquet {
+                   .apply();
+ 
+           return new org.apache.iceberg.parquet.ParquetReader<>(
+-              file, schema, options, readBuilder, mapping, filter, reuseContainers, caseSensitive);
++              file, schema, optionsBuilder.build(), readBuilder, mapping, filter, reuseContainers, caseSensitive);
+         }
+       }
+ 
+@@ -1490,17 +1496,7 @@ public class Parquet {
+       if (filter != null) {
+         // TODO: should not need to get the schema to push down before opening the file.
+         // Parquet should allow setting a filter inside its read support
+-        ParquetReadOptions decryptOptions =
+-            ParquetReadOptions.builder(new PlainParquetConfiguration())
+-                .withDecryption(fileDecryptionProperties)
+-                .build();
+-        MessageType type;
+-        try (ParquetFileReader schemaReader =
+-            ParquetFileReader.open(ParquetIO.file(file), decryptOptions)) {
+-          type = schemaReader.getFileMetaData().getSchema();
+-        } catch (IOException e) {
+-          throw new RuntimeIOException(e);
+-        }
++        MessageType type = getSchemaFromFile(fileDecryptionProperties);
+         Schema fileSchema = ParquetSchemaUtil.convert(type);
+         builder
+             .useStatsFilter()
+@@ -1535,6 +1531,19 @@ public class Parquet {
+ 
+       return new ParquetIterable<>(builder);
+     }
++
++    private MessageType getSchemaFromFile(FileDecryptionProperties fileDecryptionProperties) {
++      ParquetReadOptions decryptOptions =
++          ParquetReadOptions.builder(new PlainParquetConfiguration())
++              .withDecryption(fileDecryptionProperties)
++              .build();
++      try (ParquetFileReader schemaReader =
++               ParquetFileReader.open(ParquetIO.file(file), decryptOptions)) {
++        return schemaReader.getFileMetaData().getSchema();
++      } catch (IOException e) {
++        throw new RuntimeIOException(e);
++      }
++    }
+   }
+ 
+   private static class ParquetReadBuilder<T> extends ParquetReader.Builder<T> {
+diff --git a/src/parquet/src/main/java/org/apache/iceberg/parquet/ReadConf.java b/src/parquet/src/main/java/org/apache/iceberg/parquet/ReadConf.java
+index 1fb2372b..9297611a 100644
+--- a/src/parquet/src/main/java/org/apache/iceberg/parquet/ReadConf.java
++++ b/src/parquet/src/main/java/org/apache/iceberg/parquet/ReadConf.java
+@@ -116,7 +116,11 @@ class ReadConf<T> {
+       }
+     }
+ 
+-    this.totalValues = computedTotalValues;
++    if (batchedReaderFunc != null && options.useRecordFilter()) {
++      this.totalValues = reader.getFilteredRecordCount();
++    } else {
++      this.totalValues = computedTotalValues;
++    }
+     if (readerFunc != null) {
+       this.model = (ParquetValueReader<T>) readerFunc.apply(typeWithIds);
+       this.vectorizedModel = null;
+diff --git a/src/parquet/src/main/java/org/apache/iceberg/parquet/ValuesAsBytesReader.java b/src/parquet/src/main/java/org/apache/iceberg/parquet/ValuesAsBytesReader.java
+index 71e10247..4c3dd62c 100644
+--- a/src/parquet/src/main/java/org/apache/iceberg/parquet/ValuesAsBytesReader.java
++++ b/src/parquet/src/main/java/org/apache/iceberg/parquet/ValuesAsBytesReader.java
+@@ -102,11 +102,15 @@ public class ValuesAsBytesReader extends ValuesReader {
+     return value;
+   }
+ 
+-  private byte getByte() {
++  public byte getByte() {
+     try {
+       return (byte) valuesInputStream.read();
+     } catch (IOException e) {
+       throw new ParquetDecodingException("Failed to read a byte", e);
+     }
+   }
++
++  public ByteBufferInputStream getValuesInputStream() {
++    return valuesInputStream;
++  }
+ }
+diff --git a/src/parquet/src/main/java/org/apache/iceberg/parquet/VectorizedParquetReader.java b/src/parquet/src/main/java/org/apache/iceberg/parquet/VectorizedParquetReader.java
+index fc10a57e..4fff7163 100644
+--- a/src/parquet/src/main/java/org/apache/iceberg/parquet/VectorizedParquetReader.java
++++ b/src/parquet/src/main/java/org/apache/iceberg/parquet/VectorizedParquetReader.java
+@@ -158,7 +158,7 @@ public class VectorizedParquetReader<T> extends CloseableGroup implements Closea
+       }
+       PageReadStore pages;
+       try {
+-        pages = reader.readNextRowGroup();
++        pages = reader.readFilteredRowGroup(nextRowGroup);
+       } catch (IOException e) {
+         throw new RuntimeIOException(e);
+       }
+diff --git a/src/spark/v3.4/spark/src/test/java/org/apache/iceberg/spark/data/parquet/vectorized/TestParquetPageSkippingVectorizedReads.java b/src/spark/v3.4/spark/src/test/java/org/apache/iceberg/spark/data/parquet/vectorized/TestParquetPageSkippingVectorizedReads.java
+new file mode 100644
+index 00000000..fafa42ae
+--- /dev/null
++++ b/src/spark/v3.4/spark/src/test/java/org/apache/iceberg/spark/data/parquet/vectorized/TestParquetPageSkippingVectorizedReads.java
+@@ -0,0 +1,220 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.iceberg.spark.data.vectorized.parquet;
++
++import static org.apache.iceberg.TableProperties.PARQUET_PAGE_ROW_LIMIT;
++import static org.apache.iceberg.TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES;
++import static org.assertj.core.api.Assertions.assertThat;
++
++import java.io.File;
++import java.io.IOException;
++import java.nio.file.Path;
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.Iterator;
++import java.util.List;
++import java.util.function.Function;
++import java.util.stream.Collectors;
++import org.apache.iceberg.Files;
++import org.apache.iceberg.Schema;
++import org.apache.iceberg.data.RandomGenericData;
++import org.apache.iceberg.data.Record;
++import org.apache.iceberg.data.parquet.GenericParquetWriter;
++import org.apache.iceberg.expressions.Expression;
++import org.apache.iceberg.expressions.Expressions;
++import org.apache.iceberg.io.CloseableIterable;
++import org.apache.iceberg.io.FileAppender;
++import org.apache.iceberg.parquet.Parquet;
++import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
++import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
++import org.apache.iceberg.relocated.com.google.common.collect.Lists;
++import org.apache.iceberg.spark.data.AvroDataTestBase;
++import org.apache.iceberg.spark.data.GenericsHelpers;
++import org.apache.iceberg.spark.data.vectorized.VectorizedSparkParquetReaders;
++import org.apache.iceberg.util.Pair;
++import org.apache.spark.sql.vectorized.ColumnarBatch;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.io.TempDir;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++public class TestParquetPageSkippingVectorizedReads extends AvroDataTestBase {
++  private static final Logger LOG =
++      LoggerFactory.getLogger(TestParquetPageSkippingVectorizedReads.class);
++
++  private static final Schema PRIMITIVES_SCHEMA = new Schema(SUPPORTED_PRIMITIVES.fields());
++
++  @TempDir protected static Path temp;
++
++  private static List<Record> allRecords = Lists.newArrayList();
++
++  /* Column and offset indexes info of `l` column in `testFile` copied from text printed by parquet-cli's
++  column-index command:
++  row-group 0:
++  column index for column l:
++                    null count                   min                  max
++  page-0                     0                     0                   99
++  page-1                     0                   100                  199
++  page-2                     0                   200                  299
++  page-3                     0                   300                  399
++  page-4                     0                   400                  499
++  page-5                     0                   500                  599
++  page-6                     0                   600                  618
++  offset index for column l:
++                        offset       compressed size       first row index
++  page-0                 21370                   213                     0
++  page-1                 21583                   213                   100
++  page-2                 21796                   213                   200
++  page-3                 22009                   216                   300
++  page-4                 22225                   217                   400
++  page-5                 22442                   216                   500
++  page-6                 22658                    87                   600
++  row-group 1:
++  column index for column l:
++                    null count                   min                  max
++  page-0                     0                   619                  718
++  page-1                     0                   719                  818
++  page-2                     0                   819                  918
++  page-3                     0                   919                  999
++  offset index for column l:
++                        offset       compressed size       first row index
++  page-0                117388                   217                     0
++  page-1                117605                   216                   100
++  page-2                117821                   217                   200
++  page-3                118038                   188                   300
++  */
++  private static long index = -1;
++  private static File testFile;
++
++  @BeforeAll
++  public static void generateFile() throws IOException {
++    Function<Record, Record> transform =
++        record -> {
++          index += 1;
++          record.setField("l", index);
++          return record;
++        };
++    int numRecords = 1000;
++    allRecords =
++        RandomGenericData.generate(PRIMITIVES_SCHEMA, numRecords, 0L).stream()
++            .map(transform)
++            .collect(Collectors.toList());
++    testFile = File.createTempFile("junit", null, temp.toFile());
++    assertThat(testFile.delete()).as("Delete should succeed").isTrue();
++    try (FileAppender<Record> fileAppender =
++        Parquet.write(Files.localOutput(testFile))
++            .schema(PRIMITIVES_SCHEMA)
++            .createWriterFunc(GenericParquetWriter::create)
++            .set(PARQUET_PAGE_ROW_LIMIT, "100")
++            .set(PARQUET_ROW_GROUP_SIZE_BYTES, "80000") // 2 row groups
++            .named("page-skipping-test")
++            .build()) {
++      fileAppender.addAll(allRecords.iterator());
++    }
++  }
++
++  @Test
++  public void testSinglePageMatch() {
++    Expression filter =
++        Expressions.and(
++            Expressions.greaterThanOrEqual("l", 150),
++            Expressions.lessThan("l", 200)); // page-1 in row group 0  -> row ranges: [100, 199]
++
++    List<Record> expected = selectRecords(allRecords, Pair.of(100, 200));
++    readAndValidate(filter, expected);
++  }
++
++  @Test
++  public void testMultiplePagesMatch() {
++    Expression filter =
++        Expressions.or(
++            // page-1 in row group 0 -> row ranges: [100, 199]
++            Expressions.and(
++                Expressions.greaterThanOrEqual("l", 150), Expressions.lessThan("l", 200)),
++            // page-3, page-4 in row group 0  -> row ranges[300, 499]
++            Expressions.and(
++                Expressions.greaterThanOrEqual("l", 350), Expressions.lessThan("l", 450)));
++
++    List<Record> expected = selectRecords(allRecords, Pair.of(100, 200), Pair.of(300, 500));
++    readAndValidate(filter, expected);
++  }
++
++  @Test
++  public void testMultipleRowGroupsMatch() {
++    Expression filter =
++        Expressions.or(
++            // page-1 in row group 0 -> row ranges: [100, 199]
++            Expressions.and(
++                Expressions.greaterThanOrEqual("l", 150), Expressions.lessThan("l", 200)),
++            // page-3, page-4 in row group 0  -> row ranges[300, 499]
++            Expressions.and(
++                Expressions.greaterThanOrEqual("l", 350), Expressions.lessThan("l", 450)));
++    filter =
++        Expressions.or(
++            filter,
++            // firstRowIndex in row group 1 -> 619
++            // page-1, page-2 in row group 1 -> row ranges: [100, 299]
++            Expressions.and(
++                Expressions.greaterThanOrEqual("l", 750), Expressions.lessThan("l", 850)));
++
++    List<Record> expected =
++        selectRecords(allRecords, Pair.of(100, 200), Pair.of(300, 500), Pair.of(719, 919));
++    readAndValidate(filter, expected);
++  }
++
++  @Test
++  public void testNoRowsMatch() {
++    Expression filter = Expressions.greaterThan("l", 1000);
++    readAndValidate(filter, ImmutableList.of());
++  }
++
++  @Test
++  public void testAllRowsMatch() {
++    Expression filter = Expressions.greaterThanOrEqual("l", Long.MIN_VALUE);
++    readAndValidate(filter, allRecords);
++  }
++
++  private void readAndValidate(Expression filter, List<Record> expected) {
++    Parquet.ReadBuilder builder =
++        Parquet.read(Files.localInput(testFile)).project(PRIMITIVES_SCHEMA).filter(filter);
++    CloseableIterable<ColumnarBatch> batches =
++        builder
++            .createBatchedReaderFunc(
++                type ->
++                    VectorizedSparkParquetReaders.buildReader(
++                        PRIMITIVES_SCHEMA, type, ImmutableMap.of(), null))
++            .build();
++    Iterator<Record> expectedIter = expected.iterator();
++    for (ColumnarBatch batch : batches) {
++      GenericsHelpers.assertEqualsBatch(
++          SUPPORTED_PRIMITIVES, expectedIter, batch, null, batch.numRows());
++    }
++  }
++
++  private List<Record> selectRecords(List<Record> records, Pair<Integer, Integer>... ranges) {
++    return Arrays.stream(ranges)
++        .map(range -> records.subList(range.first(), range.second()))
++        .flatMap(Collection::stream)
++        .collect(Collectors.toList());
++  }
++
++  @Override
++  protected void writeAndValidate(Schema schema) throws IOException {}
++}
+diff --git a/src/spark/v3.5/spark/src/test/java/org/apache/iceberg/spark/data/vectorized/parquet/TestParquetPageSkippingVectorizedReads.java b/src/spark/v3.5/spark/src/test/java/org/apache/iceberg/spark/data/vectorized/parquet/TestParquetPageSkippingVectorizedReads.java
+new file mode 100644
+index 00000000..f45d43e9
+--- /dev/null
++++ b/src/spark/v3.5/spark/src/test/java/org/apache/iceberg/spark/data/vectorized/parquet/TestParquetPageSkippingVectorizedReads.java
+@@ -0,0 +1,220 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.iceberg.spark.data.vectorized.parquet;
++
++import static org.apache.iceberg.TableProperties.PARQUET_PAGE_ROW_LIMIT;
++import static org.apache.iceberg.TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES;
++import static org.assertj.core.api.Assertions.assertThat;
++
++import java.io.File;
++import java.io.IOException;
++import java.nio.file.Path;
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.Iterator;
++import java.util.List;
++import java.util.function.Function;
++import java.util.stream.Collectors;
++import org.apache.iceberg.Files;
++import org.apache.iceberg.Schema;
++import org.apache.iceberg.data.RandomGenericData;
++import org.apache.iceberg.data.Record;
++import org.apache.iceberg.data.parquet.GenericParquetWriter;
++import org.apache.iceberg.expressions.Expression;
++import org.apache.iceberg.expressions.Expressions;
++import org.apache.iceberg.io.CloseableIterable;
++import org.apache.iceberg.io.FileAppender;
++import org.apache.iceberg.parquet.Parquet;
++import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
++import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
++import org.apache.iceberg.relocated.com.google.common.collect.Lists;
++import org.apache.iceberg.spark.data.AvroDataTestBase;
++import org.apache.iceberg.spark.data.GenericsHelpers;
++import org.apache.iceberg.spark.data.vectorized.VectorizedSparkParquetReaders;
++import org.apache.iceberg.util.Pair;
++import org.apache.spark.sql.vectorized.ColumnarBatch;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.io.TempDir;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++public class TestParquetPageSkippingVectorizedReads extends AvroDataTestBase {
++  private static final Logger LOG =
++      LoggerFactory.getLogger(TestParquetPageSkippingVectorizedReads.class);
++
++  private static final Schema PRIMITIVES_SCHEMA = new Schema(SUPPORTED_PRIMITIVES.fields());
++
++  @TempDir protected static Path temp;
++
++  private static List<Record> allRecords = Lists.newArrayList();
++
++  /* Column and offset indexes info of `l` column in `testFile` copied from text printed by parquet-cli's
++  column-index command:
++  row-group 0:
++  column index for column l:
++                    null count                   min                  max
++  page-0                     0                     0                   99
++  page-1                     0                   100                  199
++  page-2                     0                   200                  299
++  page-3                     0                   300                  399
++  page-4                     0                   400                  499
++  page-5                     0                   500                  599
++  page-6                     0                   600                  618
++  offset index for column l:
++                        offset       compressed size       first row index
++  page-0                 21370                   213                     0
++  page-1                 21583                   213                   100
++  page-2                 21796                   213                   200
++  page-3                 22009                   216                   300
++  page-4                 22225                   217                   400
++  page-5                 22442                   216                   500
++  page-6                 22658                    87                   600
++  row-group 1:
++  column index for column l:
++                    null count                   min                  max
++  page-0                     0                   619                  718
++  page-1                     0                   719                  818
++  page-2                     0                   819                  918
++  page-3                     0                   919                  999
++  offset index for column l:
++                        offset       compressed size       first row index
++  page-0                117388                   217                     0
++  page-1                117605                   216                   100
++  page-2                117821                   217                   200
++  page-3                118038                   188                   300
++  */
++  private static long index = -1;
++  private static File testFile;
++
++  @BeforeAll
++  public static void generateFile() throws IOException {
++    Function<Record, Record> transform =
++        record -> {
++          index += 1;
++          record.setField("l", index);
++          return record;
++        };
++    int numRecords = 1000;
++    allRecords =
++        RandomGenericData.generate(PRIMITIVES_SCHEMA, numRecords, 0L).stream()
++            .map(transform)
++            .collect(Collectors.toList());
++    testFile = File.createTempFile("junit", null, temp.toFile());
++    assertThat(testFile.delete()).as("Delete should succeed").isTrue();
++    try (FileAppender<Record> fileAppender =
++        Parquet.write(Files.localOutput(testFile))
++            .schema(PRIMITIVES_SCHEMA)
++            .createWriterFunc(GenericParquetWriter::create)
++            .set(PARQUET_PAGE_ROW_LIMIT, "100")
++            .set(PARQUET_ROW_GROUP_SIZE_BYTES, "80000") // 2 row groups
++            .named("page-skipping-test")
++            .build()) {
++      fileAppender.addAll(allRecords.iterator());
++    }
++  }
++
++  @Test
++  public void testSinglePageMatch() {
++    Expression filter =
++        Expressions.and(
++            Expressions.greaterThanOrEqual("l", 150),
++            Expressions.lessThan("l", 200)); // page-1 in row group 0  -> row ranges: [100, 199]
++
++    List<Record> expected = selectRecords(allRecords, Pair.of(100, 200));
++    readAndValidate(filter, expected);
++  }
++
++  @Test
++  public void testMultiplePagesMatch() {
++    Expression filter =
++        Expressions.or(
++            // page-1 in row group 0 -> row ranges: [100, 199]
++            Expressions.and(
++                Expressions.greaterThanOrEqual("l", 150), Expressions.lessThan("l", 200)),
++            // page-3, page-4 in row group 0  -> row ranges[300, 499]
++            Expressions.and(
++                Expressions.greaterThanOrEqual("l", 350), Expressions.lessThan("l", 450)));
++
++    List<Record> expected = selectRecords(allRecords, Pair.of(100, 200), Pair.of(300, 500));
++    readAndValidate(filter, expected);
++  }
++
++  @Test
++  public void testMultipleRowGroupsMatch() {
++    Expression filter =
++        Expressions.or(
++            // page-1 in row group 0 -> row ranges: [100, 199]
++            Expressions.and(
++                Expressions.greaterThanOrEqual("l", 150), Expressions.lessThan("l", 200)),
++            // page-3, page-4 in row group 0  -> row ranges[300, 499]
++            Expressions.and(
++                Expressions.greaterThanOrEqual("l", 350), Expressions.lessThan("l", 450)));
++    filter =
++        Expressions.or(
++            filter,
++            // firstRowIndex in row group 1 -> 619
++            // page-1, page-2 in row group 1 -> row ranges: [100, 299]
++            Expressions.and(
++                Expressions.greaterThanOrEqual("l", 750), Expressions.lessThan("l", 850)));
++
++    List<Record> expected =
++        selectRecords(allRecords, Pair.of(100, 200), Pair.of(300, 500), Pair.of(719, 919));
++    readAndValidate(filter, expected);
++  }
++
++  @Test
++  public void testNoRowsMatch() {
++    Expression filter = Expressions.greaterThan("l", 1000);
++    readAndValidate(filter, ImmutableList.of());
++  }
++
++  @Test
++  public void testAllRowsMatch() {
++    Expression filter = Expressions.greaterThanOrEqual("l", Long.MIN_VALUE);
++    readAndValidate(filter, allRecords);
++  }
++
++  private void readAndValidate(Expression filter, List<Record> expected) {
++    Parquet.ReadBuilder builder =
++        Parquet.read(Files.localInput(testFile)).project(PRIMITIVES_SCHEMA).filter(filter);
++    CloseableIterable<ColumnarBatch> batches =
++        builder
++            .createBatchedReaderFunc(
++                type ->
++                    VectorizedSparkParquetReaders.buildReader(
++                        PRIMITIVES_SCHEMA, type, ImmutableMap.of()))
++            .build();
++    Iterator<Record> expectedIter = expected.iterator();
++    for (ColumnarBatch batch : batches) {
++      GenericsHelpers.assertEqualsBatch(
++          SUPPORTED_PRIMITIVES, expectedIter, batch, null, batch.numRows());
++    }
++  }
++
++  private List<Record> selectRecords(List<Record> records, Pair<Integer, Integer>... ranges) {
++    return Arrays.stream(ranges)
++        .map(range -> records.subList(range.first(), range.second()))
++        .flatMap(Collection::stream)
++        .collect(Collectors.toList());
++  }
++
++  @Override
++  protected void writeAndValidate(Schema schema) throws IOException {}
++}
+diff --git a/src/spark/v4.0/spark/src/test/java/org/apache/iceberg/spark/data/vectorized/parquet/TestParquetPageSkippingVectorizedReads.java b/src/spark/v4.0/spark/src/test/java/org/apache/iceberg/spark/data/vectorized/parquet/TestParquetPageSkippingVectorizedReads.java
+new file mode 100644
+index 00000000..fafa42ae
+--- /dev/null
++++ b/src/spark/v4.0/spark/src/test/java/org/apache/iceberg/spark/data/vectorized/parquet/TestParquetPageSkippingVectorizedReads.java
+@@ -0,0 +1,220 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.iceberg.spark.data.vectorized.parquet;
++
++import static org.apache.iceberg.TableProperties.PARQUET_PAGE_ROW_LIMIT;
++import static org.apache.iceberg.TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES;
++import static org.assertj.core.api.Assertions.assertThat;
++
++import java.io.File;
++import java.io.IOException;
++import java.nio.file.Path;
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.Iterator;
++import java.util.List;
++import java.util.function.Function;
++import java.util.stream.Collectors;
++import org.apache.iceberg.Files;
++import org.apache.iceberg.Schema;
++import org.apache.iceberg.data.RandomGenericData;
++import org.apache.iceberg.data.Record;
++import org.apache.iceberg.data.parquet.GenericParquetWriter;
++import org.apache.iceberg.expressions.Expression;
++import org.apache.iceberg.expressions.Expressions;
++import org.apache.iceberg.io.CloseableIterable;
++import org.apache.iceberg.io.FileAppender;
++import org.apache.iceberg.parquet.Parquet;
++import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
++import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
++import org.apache.iceberg.relocated.com.google.common.collect.Lists;
++import org.apache.iceberg.spark.data.AvroDataTestBase;
++import org.apache.iceberg.spark.data.GenericsHelpers;
++import org.apache.iceberg.spark.data.vectorized.VectorizedSparkParquetReaders;
++import org.apache.iceberg.util.Pair;
++import org.apache.spark.sql.vectorized.ColumnarBatch;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.io.TempDir;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++public class TestParquetPageSkippingVectorizedReads extends AvroDataTestBase {
++  private static final Logger LOG =
++      LoggerFactory.getLogger(TestParquetPageSkippingVectorizedReads.class);
++
++  private static final Schema PRIMITIVES_SCHEMA = new Schema(SUPPORTED_PRIMITIVES.fields());
++
++  @TempDir protected static Path temp;
++
++  private static List<Record> allRecords = Lists.newArrayList();
++
++  /* Column and offset indexes info of `l` column in `testFile` copied from text printed by parquet-cli's
++  column-index command:
++  row-group 0:
++  column index for column l:
++                    null count                   min                  max
++  page-0                     0                     0                   99
++  page-1                     0                   100                  199
++  page-2                     0                   200                  299
++  page-3                     0                   300                  399
++  page-4                     0                   400                  499
++  page-5                     0                   500                  599
++  page-6                     0                   600                  618
++  offset index for column l:
++                        offset       compressed size       first row index
++  page-0                 21370                   213                     0
++  page-1                 21583                   213                   100
++  page-2                 21796                   213                   200
++  page-3                 22009                   216                   300
++  page-4                 22225                   217                   400
++  page-5                 22442                   216                   500
++  page-6                 22658                    87                   600
++  row-group 1:
++  column index for column l:
++                    null count                   min                  max
++  page-0                     0                   619                  718
++  page-1                     0                   719                  818
++  page-2                     0                   819                  918
++  page-3                     0                   919                  999
++  offset index for column l:
++                        offset       compressed size       first row index
++  page-0                117388                   217                     0
++  page-1                117605                   216                   100
++  page-2                117821                   217                   200
++  page-3                118038                   188                   300
++  */
++  private static long index = -1;
++  private static File testFile;
++
++  @BeforeAll
++  public static void generateFile() throws IOException {
++    Function<Record, Record> transform =
++        record -> {
++          index += 1;
++          record.setField("l", index);
++          return record;
++        };
++    int numRecords = 1000;
++    allRecords =
++        RandomGenericData.generate(PRIMITIVES_SCHEMA, numRecords, 0L).stream()
++            .map(transform)
++            .collect(Collectors.toList());
++    testFile = File.createTempFile("junit", null, temp.toFile());
++    assertThat(testFile.delete()).as("Delete should succeed").isTrue();
++    try (FileAppender<Record> fileAppender =
++        Parquet.write(Files.localOutput(testFile))
++            .schema(PRIMITIVES_SCHEMA)
++            .createWriterFunc(GenericParquetWriter::create)
++            .set(PARQUET_PAGE_ROW_LIMIT, "100")
++            .set(PARQUET_ROW_GROUP_SIZE_BYTES, "80000") // 2 row groups
++            .named("page-skipping-test")
++            .build()) {
++      fileAppender.addAll(allRecords.iterator());
++    }
++  }
++
++  @Test
++  public void testSinglePageMatch() {
++    Expression filter =
++        Expressions.and(
++            Expressions.greaterThanOrEqual("l", 150),
++            Expressions.lessThan("l", 200)); // page-1 in row group 0  -> row ranges: [100, 199]
++
++    List<Record> expected = selectRecords(allRecords, Pair.of(100, 200));
++    readAndValidate(filter, expected);
++  }
++
++  @Test
++  public void testMultiplePagesMatch() {
++    Expression filter =
++        Expressions.or(
++            // page-1 in row group 0 -> row ranges: [100, 199]
++            Expressions.and(
++                Expressions.greaterThanOrEqual("l", 150), Expressions.lessThan("l", 200)),
++            // page-3, page-4 in row group 0  -> row ranges[300, 499]
++            Expressions.and(
++                Expressions.greaterThanOrEqual("l", 350), Expressions.lessThan("l", 450)));
++
++    List<Record> expected = selectRecords(allRecords, Pair.of(100, 200), Pair.of(300, 500));
++    readAndValidate(filter, expected);
++  }
++
++  @Test
++  public void testMultipleRowGroupsMatch() {
++    Expression filter =
++        Expressions.or(
++            // page-1 in row group 0 -> row ranges: [100, 199]
++            Expressions.and(
++                Expressions.greaterThanOrEqual("l", 150), Expressions.lessThan("l", 200)),
++            // page-3, page-4 in row group 0  -> row ranges[300, 499]
++            Expressions.and(
++                Expressions.greaterThanOrEqual("l", 350), Expressions.lessThan("l", 450)));
++    filter =
++        Expressions.or(
++            filter,
++            // firstRowIndex in row group 1 -> 619
++            // page-1, page-2 in row group 1 -> row ranges: [100, 299]
++            Expressions.and(
++                Expressions.greaterThanOrEqual("l", 750), Expressions.lessThan("l", 850)));
++
++    List<Record> expected =
++        selectRecords(allRecords, Pair.of(100, 200), Pair.of(300, 500), Pair.of(719, 919));
++    readAndValidate(filter, expected);
++  }
++
++  @Test
++  public void testNoRowsMatch() {
++    Expression filter = Expressions.greaterThan("l", 1000);
++    readAndValidate(filter, ImmutableList.of());
++  }
++
++  @Test
++  public void testAllRowsMatch() {
++    Expression filter = Expressions.greaterThanOrEqual("l", Long.MIN_VALUE);
++    readAndValidate(filter, allRecords);
++  }
++
++  private void readAndValidate(Expression filter, List<Record> expected) {
++    Parquet.ReadBuilder builder =
++        Parquet.read(Files.localInput(testFile)).project(PRIMITIVES_SCHEMA).filter(filter);
++    CloseableIterable<ColumnarBatch> batches =
++        builder
++            .createBatchedReaderFunc(
++                type ->
++                    VectorizedSparkParquetReaders.buildReader(
++                        PRIMITIVES_SCHEMA, type, ImmutableMap.of(), null))
++            .build();
++    Iterator<Record> expectedIter = expected.iterator();
++    for (ColumnarBatch batch : batches) {
++      GenericsHelpers.assertEqualsBatch(
++          SUPPORTED_PRIMITIVES, expectedIter, batch, null, batch.numRows());
++    }
++  }
++
++  private List<Record> selectRecords(List<Record> records, Pair<Integer, Integer>... ranges) {
++    return Arrays.stream(ranges)
++        .map(range -> records.subList(range.first(), range.second()))
++        .flatMap(Collection::stream)
++        .collect(Collectors.toList());
++  }
++
++  @Override
++  protected void writeAndValidate(Schema schema) throws IOException {}
++}
